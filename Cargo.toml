@@ -39,7 +39,7 @@ want = "0.3"
 # Optional
 
 libc = { git = "https://github.com/wasix-org/libc.git", optional = true }
-socket2 = { git = "https://github.com/wasix-org/socket2.git", branch = "v0.4.7", optional = true, features = ["all"] }
+socket2 = { git = "https://github.com/wasix-org/socket2.git", branch = "v0.4.9", optional = true, features = ["all"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
