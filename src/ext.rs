@@ -94,6 +94,7 @@ impl fmt::Debug for Protocol {
 /// ```
 ///
 /// [`http1_preserve_header_case`]: /client/struct.Client.html#method.http1_preserve_header_case
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct HeaderCaseMap(HeaderMap<Bytes>);
 

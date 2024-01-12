@@ -13,14 +13,18 @@ use hyper::{Body, Client, Request, Response, Server, Version};
 pub use futures_util::{
     future, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
-pub use hyper::{HeaderMap, StatusCode};
+pub use hyper::{ext::Protocol, HeaderMap};
+#[allow(unused_imports)]
+pub use hyper::{http::Extensions, StatusCode};
 pub use std::net::SocketAddr;
 
 #[allow(unused_macros)]
 macro_rules! t {
     (
+        @impl
         $name:ident,
-        parallel: $range:expr
+        parallel: $range:expr,
+        $(h2_only: $_h2_only:expr)?
     ) => (
         #[test]
         fn $name() {
@@ -75,6 +79,7 @@ macro_rules! t {
         }
     );
     (
+        @impl
         $name:ident,
         client: $(
             request: $(
@@ -91,7 +96,8 @@ macro_rules! t {
             response: $(
                 $s_res_prop:ident: $s_res_val:tt,
             )*;
-        )*
+        )*,
+        h2_only: $h2_only:expr
     ) => (
         #[test]
         fn $name() {
@@ -116,15 +122,17 @@ macro_rules! t {
                 }
             ),)*];
 
-            __run_test(__TestConfig {
-                client_version: 1,
-                client_msgs: c.clone(),
-                server_version: 1,
-                server_msgs: s.clone(),
-                parallel: false,
-                connections: 1,
-                proxy: false,
-            });
+            if !$h2_only {
+                __run_test(__TestConfig {
+                    client_version: 1,
+                    client_msgs: c.clone(),
+                    server_version: 1,
+                    server_msgs: s.clone(),
+                    parallel: false,
+                    connections: 1,
+                    proxy: false,
+                });
+            }
 
             __run_test(__TestConfig {
                 client_version: 2,
@@ -136,15 +144,17 @@ macro_rules! t {
                 proxy: false,
             });
 
-            __run_test(__TestConfig {
-                client_version: 1,
-                client_msgs: c.clone(),
-                server_version: 1,
-                server_msgs: s.clone(),
-                parallel: false,
-                connections: 1,
-                proxy: true,
-            });
+            if !$h2_only {
+                __run_test(__TestConfig {
+                    client_version: 1,
+                    client_msgs: c.clone(),
+                    server_version: 1,
+                    server_msgs: s.clone(),
+                    parallel: false,
+                    connections: 1,
+                    proxy: true,
+                });
+            }
 
             __run_test(__TestConfig {
                 client_version: 2,
@@ -157,6 +167,12 @@ macro_rules! t {
             });
         }
     );
+    (h2_only; $($t:tt)*) => {
+        t!(@impl $($t)*, h2_only: true);
+    };
+    ($($t:tt)*) => {
+        t!(@impl $($t)*, h2_only: false);
+    };
 }
 
 macro_rules! __internal_map_prop {
@@ -245,6 +261,7 @@ pub struct __CReq {
     pub uri: &'static str,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    pub protocol: Option<&'static str>,
 }
 
 impl Default for __CReq {
@@ -254,6 +271,7 @@ impl Default for __CReq {
             uri: "/",
             headers: HeaderMap::new(),
             body: Vec::new(),
+            protocol: None,
         }
     }
 }
@@ -356,6 +374,7 @@ async fn async_test(cfg: __TestConfig) {
                 func(&req.headers());
             }
             let sbody = sreq.body;
+            #[allow(deprecated)]
             hyper::body::to_bytes(req).map_ok(move |body| {
                 assert_eq!(body.as_ref(), sbody.as_slice(), "client body");
 
@@ -371,6 +390,7 @@ async fn async_test(cfg: __TestConfig) {
 
     let server = hyper::Server::bind(&SocketAddr::from(([127, 0, 0, 1], 0)))
         .http2_only(cfg.server_version == 2)
+        .http2_enable_connect_protocol()
         .serve(new_service);
 
     let mut addr = server.local_addr();
@@ -398,6 +418,9 @@ async fn async_test(cfg: __TestConfig) {
                 //.headers(creq.headers)
                 .body(creq.body.into())
                 .expect("Request::build");
+            if let Some(protocol) = creq.protocol {
+                req.extensions_mut().insert(Protocol::from_static(protocol));
+            }
             *req.headers_mut() = creq.headers;
             let cstatus = cres.status;
             let cheaders = cres.headers;
@@ -411,6 +434,7 @@ async fn async_test(cfg: __TestConfig) {
                     for func in &cheaders {
                         func(&res.headers());
                     }
+                    #[allow(deprecated)]
                     hyper::body::to_bytes(res)
                 })
                 .map_ok(move |body| {
@@ -458,18 +482,20 @@ fn naive_proxy(cfg: ProxyConfig) -> (SocketAddr, impl Future<Output = ()>) {
     let max_connections = cfg.connections;
     let counter = AtomicUsize::new(0);
 
-    let srv = Server::bind(&([127, 0, 0, 1], 0).into()).serve(make_service_fn(move |_| {
-        let prev = counter.fetch_add(1, Ordering::Relaxed);
-        assert!(max_connections > prev, "proxy max connections");
-        let client = client.clone();
-        future::ok::<_, hyper::Error>(service_fn(move |mut req| {
-            let uri = format!("http://{}{}", dst_addr, req.uri().path())
-                .parse()
-                .expect("proxy new uri parse");
-            *req.uri_mut() = uri;
-            client.request(req)
-        }))
-    }));
+    let srv = Server::bind(&([127, 0, 0, 1], 0).into())
+        .http2_enable_connect_protocol()
+        .serve(make_service_fn(move |_| {
+            let prev = counter.fetch_add(1, Ordering::Relaxed);
+            assert!(max_connections > prev, "proxy max connections");
+            let client = client.clone();
+            future::ok::<_, hyper::Error>(service_fn(move |mut req| {
+                let uri = format!("http://{}{}", dst_addr, req.uri().path())
+                    .parse()
+                    .expect("proxy new uri parse");
+                *req.uri_mut() = uri;
+                client.request(req)
+            }))
+        }));
     let proxy_addr = srv.local_addr();
     (proxy_addr, srv.map(|res| res.expect("proxy error")))
 }
