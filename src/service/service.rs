@@ -22,19 +22,79 @@ pub trait Service<Request> {
     type Response;
 
     /// Errors produced by the service.
+    ///
+    /// Note: Returning an `Error` to a hyper server, the behavior depends on the
+    /// protocol. In most cases, hyper will cause the connection to be abruptly aborted.
+    /// It will abort the request however the protocol allows, either with some sort of RST_STREAM,
+    /// or killing the connection if that doesn't exist.
     type Error;
 
     /// The future response value.
     type Future: Future<Output = Result<Self::Response, Self::Error>>;
 
     /// Process the request and return the response asynchronously.
-    /// call takes a &self instead of a mut &self because:
+    /// `call` takes `&self` instead of `mut &self` because:
     /// - It prepares the way for async fn,
-    ///   since then the future only borrows &self, and thus a Service can concurrently handle
+    ///   since then the future only borrows `&self`, and thus a Service can concurrently handle
     ///   multiple outstanding requests at once.
     /// - It's clearer that Services can likely be cloned
-    /// - To share state across clones you generally need Arc<Mutex<_>>
-    ///   that means you're not really using the &mut self and could do with a &self
-    /// To see the discussion on this see: https://github.com/hyperium/hyper/issues/3040
+    /// - To share state across clones, you generally need `Arc<Mutex<_>>`
+    ///   That means you're not really using the `&mut self` and could do with a `&self`.
+    ///   The discussion on this is here: <https://github.com/hyperium/hyper/issues/3040>
     fn call(&self, req: Request) -> Self::Future;
+}
+
+impl<Request, S: Service<Request> + ?Sized> Service<Request> for &'_ S {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    #[inline]
+    fn call(&self, req: Request) -> Self::Future {
+        (**self).call(req)
+    }
+}
+
+impl<Request, S: Service<Request> + ?Sized> Service<Request> for &'_ mut S {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    #[inline]
+    fn call(&self, req: Request) -> Self::Future {
+        (**self).call(req)
+    }
+}
+
+impl<Request, S: Service<Request> + ?Sized> Service<Request> for Box<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    #[inline]
+    fn call(&self, req: Request) -> Self::Future {
+        (**self).call(req)
+    }
+}
+
+impl<Request, S: Service<Request> + ?Sized> Service<Request> for std::rc::Rc<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    #[inline]
+    fn call(&self, req: Request) -> Self::Future {
+        (**self).call(req)
+    }
+}
+
+impl<Request, S: Service<Request> + ?Sized> Service<Request> for std::sync::Arc<S> {
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    #[inline]
+    fn call(&self, req: Request) -> Self::Future {
+        (**self).call(req)
+    }
 }

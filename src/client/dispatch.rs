@@ -1,27 +1,38 @@
+use std::task::{Context, Poll};
 #[cfg(feature = "http2")]
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
+#[cfg(feature = "http2")]
 use http::{Request, Response};
+#[cfg(feature = "http2")]
 use http_body::Body;
+#[cfg(feature = "http2")]
 use pin_project_lite::pin_project;
 use tokio::sync::{mpsc, oneshot};
-use tracing::trace;
 
-use crate::{
-    body::Incoming,
-    common::{task, Poll},
-};
 #[cfg(feature = "http2")]
-use crate::{common::Pin, proto::h2::client::ResponseFutMap};
+use crate::{body::Incoming, proto::h2::client::ResponseFutMap};
 
-#[cfg(test)]
-pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, (crate::Error, Option<T>)>>;
+pub(crate) type RetryPromise<T, U> = oneshot::Receiver<Result<U, TrySendError<T>>>;
 pub(crate) type Promise<T> = oneshot::Receiver<Result<T, crate::Error>>;
+
+/// An error when calling `try_send_request`.
+///
+/// There is a possibility of an error occurring on a connection in-between the
+/// time that a request is queued and when it is actually written to the IO
+/// transport. If that happens, it is safe to return the request back to the
+/// caller, as it was never fully sent.
+#[derive(Debug)]
+pub struct TrySendError<T> {
+    pub(crate) error: crate::Error,
+    pub(crate) message: Option<T>,
+}
 
 pub(crate) fn channel<T, U>() -> (Sender<T, U>, Receiver<T, U>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let (giver, taker) = want::new();
     let tx = Sender {
+        #[cfg(feature = "http1")]
         buffered_once: false,
         giver,
         inner: tx,
@@ -38,8 +49,9 @@ pub(crate) struct Sender<T, U> {
     /// One message is always allowed, even if the Receiver hasn't asked
     /// for it yet. This boolean keeps track of whether we've sent one
     /// without notice.
+    #[cfg(feature = "http1")]
     buffered_once: bool,
-    /// The Giver helps watch that the the Receiver side has been polled
+    /// The Giver helps watch that the Receiver side has been polled
     /// when the queue is empty. This helps us know when a request and
     /// response have been fully processed, and a connection is ready
     /// for more.
@@ -60,20 +72,24 @@ pub(crate) struct UnboundedSender<T, U> {
 }
 
 impl<T, U> Sender<T, U> {
-    pub(crate) fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
+    #[cfg(feature = "http1")]
+    pub(crate) fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<crate::Result<()>> {
         self.giver
             .poll_want(cx)
             .map_err(|_| crate::Error::new_closed())
     }
 
+    #[cfg(feature = "http1")]
     pub(crate) fn is_ready(&self) -> bool {
         self.giver.is_wanting()
     }
 
+    #[cfg(feature = "http1")]
     pub(crate) fn is_closed(&self) -> bool {
         self.giver.is_canceled()
     }
 
+    #[cfg(feature = "http1")]
     fn can_send(&mut self) -> bool {
         if self.giver.give() || !self.buffered_once {
             // If the receiver is ready *now*, then of course we can send.
@@ -87,7 +103,7 @@ impl<T, U> Sender<T, U> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "http1")]
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         if !self.can_send() {
             return Err(val);
@@ -99,6 +115,7 @@ impl<T, U> Sender<T, U> {
             .map_err(|mut e| (e.0).0.take().expect("envelope not dropped").0)
     }
 
+    #[cfg(feature = "http1")]
     pub(crate) fn send(&mut self, val: T) -> Result<Promise<U>, T> {
         if !self.can_send() {
             return Err(val);
@@ -129,7 +146,6 @@ impl<T, U> UnboundedSender<T, U> {
         self.giver.is_canceled()
     }
 
-    #[cfg(test)]
     pub(crate) fn try_send(&mut self, val: T) -> Result<RetryPromise<T, U>, T> {
         let (tx, rx) = oneshot::channel();
         self.inner
@@ -163,10 +179,7 @@ pub(crate) struct Receiver<T, U> {
 }
 
 impl<T, U> Receiver<T, U> {
-    pub(crate) fn poll_recv(
-        &mut self,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Option<(T, Callback<T, U>)>> {
+    pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<(T, Callback<T, U>)>> {
         match self.inner.poll_recv(cx) {
             Poll::Ready(item) => {
                 Poll::Ready(item.map(|mut env| env.0.take().expect("envelope not dropped")))
@@ -207,42 +220,48 @@ struct Envelope<T, U>(Option<(T, Callback<T, U>)>);
 impl<T, U> Drop for Envelope<T, U> {
     fn drop(&mut self) {
         if let Some((val, cb)) = self.0.take() {
-            cb.send(Err((
-                crate::Error::new_canceled().with("connection closed"),
-                Some(val),
-            )));
+            cb.send(Err(TrySendError {
+                error: crate::Error::new_canceled().with("connection closed"),
+                message: Some(val),
+            }));
         }
     }
 }
 
 pub(crate) enum Callback<T, U> {
     #[allow(unused)]
-    Retry(Option<oneshot::Sender<Result<U, (crate::Error, Option<T>)>>>),
+    Retry(Option<oneshot::Sender<Result<U, TrySendError<T>>>>),
     NoRetry(Option<oneshot::Sender<Result<U, crate::Error>>>),
 }
 
 impl<T, U> Drop for Callback<T, U> {
     fn drop(&mut self) {
-        // FIXME(nox): What errors do we want here?
-        let error = crate::Error::new_user_dispatch_gone().with(if std::thread::panicking() {
-            "user code panicked"
-        } else {
-            "runtime dropped the dispatch task"
-        });
-
         match self {
             Callback::Retry(tx) => {
                 if let Some(tx) = tx.take() {
-                    let _ = tx.send(Err((error, None)));
+                    let _ = tx.send(Err(TrySendError {
+                        error: dispatch_gone(),
+                        message: None,
+                    }));
                 }
             }
             Callback::NoRetry(tx) => {
                 if let Some(tx) = tx.take() {
-                    let _ = tx.send(Err(error));
+                    let _ = tx.send(Err(dispatch_gone()));
                 }
             }
         }
     }
+}
+
+#[cold]
+fn dispatch_gone() -> crate::Error {
+    // FIXME(nox): What errors do we want here?
+    crate::Error::new_user_dispatch_gone().with(if std::thread::panicking() {
+        "user code panicked"
+    } else {
+        "runtime dropped the dispatch task"
+    })
 }
 
 impl<T, U> Callback<T, U> {
@@ -255,7 +274,7 @@ impl<T, U> Callback<T, U> {
         }
     }
 
-    pub(crate) fn poll_canceled(&mut self, cx: &mut task::Context<'_>) -> Poll<()> {
+    pub(crate) fn poll_canceled(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match *self {
             Callback::Retry(Some(ref mut tx)) => tx.poll_closed(cx),
             Callback::NoRetry(Some(ref mut tx)) => tx.poll_closed(cx),
@@ -263,15 +282,31 @@ impl<T, U> Callback<T, U> {
         }
     }
 
-    pub(crate) fn send(mut self, val: Result<U, (crate::Error, Option<T>)>) {
+    pub(crate) fn send(mut self, val: Result<U, TrySendError<T>>) {
         match self {
             Callback::Retry(ref mut tx) => {
                 let _ = tx.take().unwrap().send(val);
             }
             Callback::NoRetry(ref mut tx) => {
-                let _ = tx.take().unwrap().send(val.map_err(|e| e.0));
+                let _ = tx.take().unwrap().send(val.map_err(|e| e.error));
             }
         }
+    }
+}
+
+impl<T> TrySendError<T> {
+    /// Take the message from this error.
+    ///
+    /// The message will not always have been recovered. If an error occurs
+    /// after the message has been serialized onto the connection, it will not
+    /// be available here.
+    pub fn take_message(&mut self) -> Option<T> {
+        self.message.take()
+    }
+
+    /// Consumes this to return the inner error.
+    pub fn into_error(self) -> crate::Error {
+        self.error
     }
 }
 
@@ -296,7 +331,7 @@ where
 {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
         let mut call_back = this.call_back.take().expect("polled after complete");
@@ -313,14 +348,14 @@ where
                     Poll::Pending => {
                         // Move call_back back to struct before return
                         this.call_back.set(Some(call_back));
-                        return std::task::Poll::Pending;
+                        return Poll::Pending;
                     }
                 };
                 trace!("send_when canceled");
                 Poll::Ready(())
             }
-            Poll::Ready(Err(err)) => {
-                call_back.send(Err(err));
+            Poll::Ready(Err((error, message))) => {
+                call_back.send(Err(TrySendError { error, message }));
                 Poll::Ready(())
             }
         }
@@ -339,7 +374,7 @@ mod tests {
     use super::{channel, Callback, Receiver};
 
     #[derive(Debug)]
-    struct Custom(i32);
+    struct Custom(#[allow(dead_code)] i32);
 
     impl<T, U> Future for Receiver<T, U> {
         type Output = Option<(T, Callback<T, U>)>;
@@ -383,8 +418,8 @@ mod tests {
         let err = fulfilled
             .expect("fulfilled")
             .expect_err("promise should error");
-        match (err.0.kind(), err.1) {
-            (&crate::error::Kind::Canceled, Some(_)) => (),
+        match (err.error.is_canceled(), err.message) {
+            (true, Some(_)) => (),
             e => panic!("expected Error::Cancel(_), found {:?}", e),
         }
     }

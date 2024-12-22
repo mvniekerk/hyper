@@ -90,9 +90,8 @@ async fn proxy(
     } else {
         let host = req.uri().host().expect("uri has no host");
         let port = req.uri().port_u16().unwrap_or(80);
-        let addr = format!("{}:{}", host, port);
 
-        let stream = TcpStream::connect(addr).await.unwrap();
+        let stream = TcpStream::connect((host, port)).await.unwrap();
         let io = TokioIo::new(stream);
 
         let (mut sender, conn) = Builder::new()
@@ -112,7 +111,7 @@ async fn proxy(
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
-    uri.authority().and_then(|auth| Some(auth.to_string()))
+    uri.authority().map(|auth| auth.to_string())
 }
 
 fn empty() -> BoxBody<Bytes, hyper::Error> {

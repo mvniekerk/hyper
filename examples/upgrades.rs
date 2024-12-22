@@ -37,7 +37,7 @@ async fn server_upgraded_io(upgraded: Upgraded) -> Result<()> {
 
     // and now write back the server 'foobar' protocol's
     // response...
-    upgraded.write_all(b"barr=foo").await?;
+    upgraded.write_all(b"bar=foo").await?;
     println!("server[foobar] sent");
     Ok(())
 }
@@ -107,7 +107,8 @@ async fn client_upgrade_request(addr: SocketAddr) -> Result<()> {
     let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
 
     tokio::task::spawn(async move {
-        if let Err(err) = conn.await {
+        // Don't forget to enable upgrades on the connection.
+        if let Err(err) = conn.with_upgrades().await {
             println!("Connection failed: {:?}", err);
         }
     });
@@ -168,7 +169,6 @@ async fn main() {
                             res = &mut conn => {
                                 if let Err(err) = res {
                                     println!("Error serving connection: {:?}", err);
-                                    return;
                                 }
                             }
                             // Continue polling the connection after enabling graceful shutdown.
@@ -186,7 +186,7 @@ async fn main() {
     });
 
     // Client requests a HTTP connection upgrade.
-    let request = client_upgrade_request(addr.clone());
+    let request = client_upgrade_request(addr);
     if let Err(e) = request.await {
         eprintln!("client error: {}", e);
     }

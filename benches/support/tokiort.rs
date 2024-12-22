@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 //! Various runtimes for hyper
 use std::{
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use futures_util::Future;
 use hyper::rt::{Sleep, Timer};
 use pin_project_lite::pin_project;
 
@@ -44,23 +44,15 @@ impl Timer for TokioTimer {
 
     fn reset(&self, sleep: &mut Pin<Box<dyn Sleep>>, new_deadline: Instant) {
         if let Some(sleep) = sleep.as_mut().downcast_mut_pin::<TokioSleep>() {
-            sleep.reset(new_deadline.into())
+            sleep.reset(new_deadline)
         }
     }
 }
 
-struct TokioTimeout<T> {
-    inner: Pin<Box<tokio::time::Timeout<T>>>,
-}
-
-impl<T> Future for TokioTimeout<T>
-where
-    T: Future,
-{
-    type Output = Result<T::Output, tokio::time::error::Elapsed>;
-
-    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        self.inner.as_mut().poll(context)
+impl TokioTimer {
+    /// Create a new TokioTimer
+    pub fn new() -> Self {
+        Self {}
     }
 }
 

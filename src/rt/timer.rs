@@ -3,12 +3,12 @@
 //! Example using tokio timer:
 //! ```rust
 //! use std::{
+//!     future::Future,
 //!     pin::Pin,
 //!     task::{Context, Poll},
 //!     time::{Duration, Instant},
 //! };
 //!
-//! use futures_util::Future;
 //! use pin_project_lite::pin_project;
 //! use hyper::rt::{Timer, Sleep};
 //!
@@ -57,7 +57,7 @@
 //!         self.project().inner.as_mut().reset(deadline.into());
 //!     }
 //! }
-//! ````
+//! ```
 
 use std::{
     any::TypeId,
@@ -104,7 +104,7 @@ impl dyn Sleep {
     }
 
     /// Downcast a pinned &mut Sleep object to its original type
-    pub fn downcast_mut_pin<T>(self: Pin<&mut Self>) -> Option<Pin<&'static mut T>>
+    pub fn downcast_mut_pin<T>(self: Pin<&mut Self>) -> Option<Pin<&mut T>>
     where
         T: Sleep + 'static,
     {

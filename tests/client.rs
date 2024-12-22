@@ -1,9 +1,6 @@
 #![deny(warnings)]
 #![warn(rust_2018_idioms)]
 
-#[macro_use]
-extern crate matches;
-
 use std::convert::Infallible;
 use std::fmt;
 use std::future::Future;
@@ -16,7 +13,7 @@ use std::time::Duration;
 use http::uri::PathAndQuery;
 use http_body_util::{BodyExt, StreamBody};
 use hyper::body::Frame;
-use hyper::header::HeaderValue;
+use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, StatusCode, Uri, Version};
 
 use bytes::Bytes;
@@ -37,10 +34,22 @@ where
     b.collect().await.map(|c| c.to_bytes())
 }
 
+async fn concat_with_trailers<B>(b: B) -> Result<(Bytes, Option<HeaderMap>), B::Error>
+where
+    B: hyper::body::Body,
+{
+    let collect = b.collect().await?;
+    let trailers = collect.trailers().cloned();
+    let bytes = collect.to_bytes();
+
+    Ok((bytes, trailers))
+}
+
 async fn tcp_connect(addr: &SocketAddr) -> std::io::Result<TokioIo<TcpStream>> {
     TcpStream::connect(*addr).await.map(TokioIo::new)
 }
 
+#[derive(Clone)]
 struct HttpInfo {
     remote_addr: SocketAddr,
 }
@@ -124,6 +133,9 @@ macro_rules! test {
                 status: $client_status:ident,
                 headers: { $($response_header_name:expr => $response_header_val:expr,)* },
                 body: $response_body:expr,
+                $(trailers: {$(
+                    $response_trailer_name:expr => $response_trailer_val:expr,
+                )*},)?
     ) => (
         #[test]
         fn $name() {
@@ -160,12 +172,23 @@ macro_rules! test {
                 );
             )*
 
-            let body = rt.block_on(concat(res))
+            let (body, _trailers) = rt.block_on(concat_with_trailers(res))
                 .expect("body concat wait");
 
             let expected_res_body = Option::<&[u8]>::from($response_body)
                 .unwrap_or_default();
             assert_eq!(body.as_ref(), expected_res_body);
+
+            $($(
+                assert_eq!(
+                    _trailers.as_ref().expect("trailers is None")
+                        .get($response_trailer_name)
+                        .expect(concat!("trailer header '", stringify!($response_trailer_name), "'")),
+                    $response_trailer_val,
+                    "trailer '{}'",
+                    stringify!($response_trailer_name),
+                );
+            )*)?
         }
     );
     (
@@ -411,6 +434,15 @@ macro_rules! __client_req_prop {
             Frame::data,
         )));
     }};
+
+    ($req_builder:ident, $body:ident, $addr:ident, body_stream_with_trailers: $body_e:expr) => {{
+        use support::trailers::StreamBodyWithTrailers;
+        let (body, trailers) = $body_e;
+        $body = BodyExt::boxed(StreamBodyWithTrailers::with_trailers(
+            futures_util::TryStreamExt::map_ok(body, Frame::data),
+            trailers,
+        ));
+    }};
 }
 
 macro_rules! __client_req_header {
@@ -632,6 +664,132 @@ test! {
             status: OK,
             headers: {},
             body: &b"hello"[..],
+}
+
+test! {
+    name: client_post_req_body_chunked_with_trailer,
+
+    server:
+        expected: "\
+            POST / HTTP/1.1\r\n\
+            trailer: chunky-trailer\r\n\
+            host: {addr}\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            chunky-trailer: header data\r\n\
+            \r\n\
+            ",
+        reply: REPLY_OK,
+
+    client:
+        request: {
+            method: POST,
+            url: "http://{addr}/",
+            headers: {
+                "trailer" => "chunky-trailer",
+            },
+            body_stream_with_trailers: (
+                (futures_util::stream::once(async { Ok::<_, Infallible>(Bytes::from("hello"))})),
+                HeaderMap::from_iter(vec![(
+                    HeaderName::from_static("chunky-trailer"),
+                    HeaderValue::from_static("header data")
+                )].into_iter())),
+        },
+        response:
+            status: OK,
+            headers: {},
+            body: None,
+}
+
+test! {
+    name: client_res_body_chunked_with_trailer,
+
+    server:
+        expected: "GET / HTTP/1.1\r\nte: trailers\r\nhost: {addr}\r\n\r\n",
+        reply: "\
+            HTTP/1.1 200 OK\r\n\
+            transfer-encoding: chunked\r\n\
+            trailer: chunky-trailer\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            chunky-trailer: header data\r\n\
+            \r\n\
+            ",
+
+    client:
+        request: {
+            method: GET,
+            url: "http://{addr}/",
+            headers: {
+                "te" => "trailers",
+            },
+        },
+        response:
+            status: OK,
+            headers: {
+                "Transfer-Encoding" => "chunked",
+            },
+            body: &b"hello"[..],
+            trailers: {
+                "chunky-trailer" => "header data",
+            },
+}
+
+test! {
+    name: client_res_body_chunked_with_pathological_trailers,
+
+    server:
+        expected: "GET / HTTP/1.1\r\nte: trailers\r\nhost: {addr}\r\n\r\n",
+        reply: "\
+            HTTP/1.1 200 OK\r\n\
+            transfer-encoding: chunked\r\n\
+            trailer: chunky-trailer1, chunky-trailer2, chunky-trailer3, chunky-trailer4, chunky-trailer5\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            chunky-trailer1: header data1\r\n\
+            chunky-trailer2: header data2\r\n\
+            chunky-trailer3: header data3\r\n\
+            chunky-trailer4: header data4\r\n\
+            chunky-trailer5: header data5\r\n\
+            sneaky-trailer: not in trailer header\r\n\
+            transfer-encoding: chunked\r\n\
+            content-length: 5\r\n\
+            trailer: foo\r\n\
+            \r\n\
+            ",
+
+    client:
+        request: {
+            method: GET,
+            url: "http://{addr}/",
+            headers: {
+                "te" => "trailers",
+            },
+        },
+        response:
+            status: OK,
+            headers: {
+                "Transfer-Encoding" => "chunked",
+            },
+            body: &b"hello"[..],
+            trailers: {
+                "chunky-trailer1" => "header data1",
+                "chunky-trailer2" => "header data2",
+                "chunky-trailer3" => "header data3",
+                "chunky-trailer4" => "header data4",
+                "chunky-trailer5" => "header data5",
+                "sneaky-trailer" => "not in trailer header",
+                "transfer-encoding" => "chunked",
+                "content-length" => "5",
+                "trailer" => "foo",
+            },
 }
 
 test! {
@@ -998,7 +1156,7 @@ test! {
             \r\n\
             ",
         reply: {
-            let long_header = std::iter::repeat("A").take(500_000).collect::<String>();
+            let long_header = "A".repeat(500_000);
             format!("\
                 HTTP/1.1 200 OK\r\n\
                 {}: {}\r\n\
@@ -1338,7 +1496,7 @@ mod conn {
     use bytes::{Buf, Bytes};
     use futures_channel::{mpsc, oneshot};
     use futures_util::future::{self, poll_fn, FutureExt, TryFutureExt};
-    use http_body_util::{BodyExt, Empty, StreamBody};
+    use http_body_util::{BodyExt, Empty, Full, StreamBody};
     use hyper::rt::Timer;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener as TkTcpListener, TcpStream};
@@ -1781,7 +1939,7 @@ mod conn {
         assert!(!io.shutdown_called, "upgrade shouldn't shutdown AsyncWrite");
         rt.block_on(poll_fn(|ctx| {
             let ready = client.poll_ready(ctx);
-            assert_matches!(ready, Poll::Ready(Err(_)));
+            assert!(matches!(ready, Poll::Ready(Err(_))));
             ready
         }))
         .unwrap_err();
@@ -1871,7 +2029,7 @@ mod conn {
 
         rt.block_on(poll_fn(|ctx| {
             let ready = client.poll_ready(ctx);
-            assert_matches!(ready, Poll::Ready(Err(_)));
+            assert!(matches!(ready, Poll::Ready(Err(_))));
             ready
         }))
         .unwrap_err();
@@ -1881,6 +2039,146 @@ mod conn {
         rt.block_on(io.write_all(b"foo=bar")).unwrap();
         rt.block_on(io.read_to_end(&mut vec)).unwrap();
         assert_eq!(vec, b"bar=foo");
+    }
+
+    #[tokio::test]
+    async fn client_100_then_http09() {
+        let (server, addr) = setup_std_test_server();
+
+        thread::spawn(move || {
+            let mut sock = server.accept().unwrap().0;
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            sock.set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0; 4096];
+            sock.read(&mut buf).expect("read 1");
+            sock.write_all(
+                b"\
+                HTTP/1.1 100 Continue\r\n\
+                Content-Type: text/plain\r\n\
+                Server: BaseHTTP/0.6 Python/3.12.5\r\n\
+                Date: Mon, 16 Dec 2024 03:08:27 GMT\r\n\
+            ",
+            )
+            .unwrap();
+            // That it's separate writes is important to this test
+            thread::sleep(Duration::from_millis(50));
+            sock.write_all(
+                b"\
+                \r\n\
+            ",
+            )
+            .expect("write 2");
+            thread::sleep(Duration::from_millis(50));
+            sock.write_all(
+                b"\
+                This is a sample text/plain document, without final headers.\
+                \n\n\
+            ",
+            )
+            .expect("write 3");
+        });
+
+        let tcp = tcp_connect(&addr).await.unwrap();
+
+        let (mut client, conn) = conn::http1::Builder::new()
+            .http09_responses(true)
+            .handshake(tcp)
+            .await
+            .unwrap();
+
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .uri("/a")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let _res = client.send_request(req).await.expect("send_request");
+    }
+
+    #[tokio::test]
+    async fn test_try_send_request() {
+        use std::future::Future;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let (io_srv, io_cli) = tokio_test::io::Builder::new()
+            .write(b"GET / HTTP/1.1\r\n\r\n")
+            .read(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+            .build_with_handle();
+
+        tokio::spawn(async move {
+            let _io = io_cli;
+            let _ = done_rx.await;
+        });
+
+        // make polling fair by putting both in spawns
+        tokio::spawn(async move {
+            let io = TokioIo::new(io_srv);
+            let (mut client, mut conn) = conn::http1::Builder::new()
+                .handshake::<_, Empty<Bytes>>(io)
+                .await
+                .expect("http handshake");
+
+            // get the conn ready
+            assert!(
+                future::poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            assert!(client.is_ready());
+
+            // use the connection once
+            let mut fut1 = std::pin::pin!(client.send_request(http::Request::new(Empty::new())));
+            let _res1 = future::poll_fn(|cx| loop {
+                if let Poll::Ready(res) = fut1.as_mut().poll(cx) {
+                    return Poll::Ready(res);
+                }
+                return match Pin::new(&mut conn).poll(cx) {
+                    Poll::Ready(_) => panic!("ruh roh"),
+                    Poll::Pending => Poll::Pending,
+                };
+            })
+            .await
+            .expect("resp 1");
+
+            assert!(client.is_ready());
+
+            // simulate the server dropping the conn
+            let _ = done_tx.send(());
+            // let the server task die
+            tokio::task::yield_now().await;
+
+            let mut fut2 =
+                std::pin::pin!(client.try_send_request(http::Request::new(Empty::new())));
+            let poll1 = future::poll_fn(|cx| Poll::Ready(fut2.as_mut().poll(cx))).await;
+            assert!(poll1.is_pending(), "not already known to error");
+
+            let mut conn_opt = Some(conn);
+            // wasn't a known error, req is in queue, and now the next poll, the
+            // conn will be noticed as errored
+            let mut err = future::poll_fn(|cx| {
+                loop {
+                    if let Poll::Ready(res) = fut2.as_mut().poll(cx) {
+                        return Poll::Ready(res);
+                    }
+                    if let Some(ref mut conn) = conn_opt {
+                        match Pin::new(conn).poll(cx) {
+                            Poll::Ready(_) => {
+                                conn_opt = None;
+                            } // ok
+                            Poll::Pending => return Poll::Pending,
+                        };
+                    }
+                }
+            })
+            .await
+            .expect_err("resp 2");
+
+            assert!(err.take_message().is_some(), "request was returned");
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1962,6 +2260,82 @@ mod conn {
         future::poll_fn(|ctx| client.poll_ready(ctx))
             .await
             .expect_err("client should be closed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http2_connect_detect_close() {
+        // Regression test for failure to fully close connections when using HTTP2 CONNECT
+        // We send 2 requests and then drop them. We should see the connection gracefully close.
+        use futures_util::future;
+        let (listener, addr) = setup_tk_test_server().await;
+        let (tx, rxx) = oneshot::channel::<()>();
+
+        tokio::task::spawn(async move {
+            use hyper::server::conn::http2;
+            use hyper::service::service_fn;
+
+            let res = listener.accept().await;
+            let (stream, _) = res.unwrap();
+            let stream = TokioIo::new(stream);
+
+            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+                tokio::task::spawn(async move {
+                    let io = &mut TokioIo::new(hyper::upgrade::on(req).await.unwrap());
+                    io.write_all(b"hello\n").await.unwrap();
+                });
+
+                future::ok::<_, hyper::Error>(Response::new(Empty::<Bytes>::new()))
+            });
+
+            tokio::task::spawn(async move {
+                let conn = http2::Builder::new(TokioExecutor).serve_connection(stream, service);
+                let _ = conn.await;
+                tx.send(()).unwrap();
+            });
+        });
+
+        let io = tcp_connect(&addr).await.expect("tcp connect");
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+
+        tokio::task::spawn(async move {
+            conn.await.expect("client conn");
+        });
+
+        // Sanity check that client is ready
+        future::poll_fn(|ctx| client.poll_ready(ctx))
+            .await
+            .expect("client poll ready sanity");
+        let requests = 2;
+        let mut clients = vec![client.clone(), client];
+        let (tx, rx) = oneshot::channel::<()>();
+        let (tx2, rx2) = oneshot::channel::<()>();
+        let mut rxs = vec![rx, rx2];
+        for _i in 0..requests {
+            let mut client = clients.pop().unwrap();
+            let rx = rxs.pop().unwrap();
+            let req = Request::builder()
+                .method(Method::CONNECT)
+                .uri(format!("{}", addr))
+                .body(Empty::<Bytes>::new())
+                .expect("request builder");
+
+            let resp = client.send_request(req).await.expect("req1 send");
+            assert_eq!(resp.status(), 200);
+            let upgrade = hyper::upgrade::on(resp).await.unwrap();
+            tokio::task::spawn(async move {
+                let _ = rx.await;
+                drop(upgrade);
+            });
+        }
+        drop(tx);
+        drop(tx2);
+        tokio::time::timeout(Duration::from_secs(1), rxx)
+            .await
+            .expect("drop with 1s")
+            .expect("tx dropped without sending");
     }
 
     #[tokio::test]
@@ -2127,6 +2501,62 @@ mod conn {
     }
 
     #[tokio::test]
+    async fn http2_responds_before_consuming_request_body() {
+        // Test that a early-response from server works correctly (request body wasn't fully consumed).
+        // https://github.com/hyperium/hyper/issues/2872
+        use hyper::service::service_fn;
+
+        let _ = pretty_env_logger::try_init();
+
+        let (listener, addr) = setup_tk_test_server().await;
+
+        // Spawn an HTTP2 server that responds before reading the whole request body.
+        // It's normal case to decline the request due to headers or size of the body.
+        tokio::spawn(async move {
+            let sock = TokioIo::new(listener.accept().await.unwrap().0);
+            hyper::server::conn::http2::Builder::new(TokioExecutor)
+                .timer(TokioTimer)
+                .serve_connection(
+                    sock,
+                    service_fn(|_req| async move {
+                        Ok::<_, hyper::Error>(Response::new(Full::new(Bytes::from(
+                            "No bread for you!",
+                        ))))
+                    }),
+                )
+                .await
+                .expect("serve_connection");
+        });
+
+        let io = tcp_connect(&addr).await.expect("tcp connect");
+        let (mut client, conn) = conn::http2::Builder::new(TokioExecutor)
+            .timer(TokioTimer)
+            .handshake(io)
+            .await
+            .expect("http handshake");
+
+        tokio::spawn(async move {
+            conn.await.expect("client conn shouldn't error");
+        });
+
+        // Use a channel to keep request stream open
+        let (_tx, recv) = mpsc::channel::<Result<Frame<Bytes>, Box<dyn Error + Send + Sync>>>(0);
+        let req = Request::post("/a").body(StreamBody::new(recv)).unwrap();
+        let resp = client.send_request(req).await.expect("send_request");
+        assert!(resp.status().is_success());
+
+        let mut body = String::new();
+        concat(resp.into_body())
+            .await
+            .unwrap()
+            .reader()
+            .read_to_string(&mut body)
+            .unwrap();
+
+        assert_eq!(&body, "No bread for you!");
+    }
+
+    #[tokio::test]
     async fn h2_connect() {
         let (listener, addr) = setup_tk_test_server().await;
 
@@ -2262,10 +2692,6 @@ mod conn {
         let error = client.send_request(req).await.unwrap_err();
 
         assert!(error.is_user());
-        assert_eq!(
-            error.to_string(),
-            "dispatch task is gone: user code panicked"
-        );
     }
 
     async fn drain_til_eof<T: tokio::io::AsyncRead + Unpin>(mut sock: T) -> io::Result<()> {

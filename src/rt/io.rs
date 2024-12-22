@@ -1,5 +1,6 @@
 use std::fmt;
 use std::mem::MaybeUninit;
+use std::ops::DerefMut;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -132,9 +133,9 @@ pub struct ReadBufCursor<'a> {
 }
 
 impl<'data> ReadBuf<'data> {
+    /// Create a new `ReadBuf` with a slice of initialized bytes.
     #[inline]
-    #[cfg(test)]
-    pub(crate) fn new(raw: &'data mut [u8]) -> Self {
+    pub fn new(raw: &'data mut [u8]) -> Self {
         let len = raw.len();
         Self {
             // SAFETY: We never de-init the bytes ourselves.
@@ -176,21 +177,25 @@ impl<'data> ReadBuf<'data> {
     }
 
     #[inline]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_init(&mut self, n: usize) {
         self.init = self.init.max(n);
     }
 
     #[inline]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) unsafe fn set_filled(&mut self, n: usize) {
         self.filled = self.filled.max(n);
     }
 
     #[inline]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) fn len(&self) -> usize {
         self.filled
     }
 
     #[inline]
+    #[cfg(all(any(feature = "client", feature = "server"), feature = "http2"))]
     pub(crate) fn init_len(&self) -> usize {
         self.init
     }
@@ -206,7 +211,7 @@ impl<'data> ReadBuf<'data> {
     }
 }
 
-impl<'data> fmt::Debug for ReadBuf<'data> {
+impl fmt::Debug for ReadBuf<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ReadBuf")
             .field("filled", &self.filled)
@@ -216,7 +221,7 @@ impl<'data> fmt::Debug for ReadBuf<'data> {
     }
 }
 
-impl<'data> ReadBufCursor<'data> {
+impl ReadBufCursor<'_> {
     /// Access the unfilled part of the buffer.
     ///
     /// # Safety
@@ -239,19 +244,29 @@ impl<'data> ReadBufCursor<'data> {
         self.buf.init = self.buf.filled.max(self.buf.init);
     }
 
+    /// Returns the number of bytes that can be written from the current
+    /// position until the end of the buffer is reached.
+    ///
+    /// This value is equal to the length of the slice returned by `as_mut()``.
     #[inline]
-    pub(crate) fn remaining(&self) -> usize {
+    pub fn remaining(&self) -> usize {
         self.buf.remaining()
     }
 
+    /// Transfer bytes into `self`` from `src` and advance the cursor
+    /// by the number of bytes written.
+    ///
+    /// # Panics
+    ///
+    /// `self` must have enough remaining capacity to contain all of `src`.
     #[inline]
-    pub(crate) fn put_slice(&mut self, buf: &[u8]) {
+    pub fn put_slice(&mut self, src: &[u8]) {
         assert!(
-            self.buf.remaining() >= buf.len(),
-            "buf.len() must fit in remaining()"
+            self.buf.remaining() >= src.len(),
+            "src.len() must fit in remaining()"
         );
 
-        let amt = buf.len();
+        let amt = src.len();
         // Cannot overflow, asserted above
         let end = self.buf.filled + amt;
 
@@ -260,7 +275,7 @@ impl<'data> ReadBufCursor<'data> {
             self.buf.raw[self.buf.filled..end]
                 .as_mut_ptr()
                 .cast::<u8>()
-                .copy_from_nonoverlapping(buf.as_ptr(), amt);
+                .copy_from_nonoverlapping(src.as_ptr(), amt);
         }
 
         if self.buf.init < end {
@@ -288,6 +303,20 @@ impl<T: ?Sized + Read + Unpin> Read for Box<T> {
 
 impl<T: ?Sized + Read + Unpin> Read for &mut T {
     deref_async_read!();
+}
+
+impl<P> Read for Pin<P>
+where
+    P: DerefMut,
+    P::Target: Read,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        pin_as_deref_mut(self).poll_read(cx, buf)
+    }
 }
 
 macro_rules! deref_async_write {
@@ -331,4 +360,46 @@ impl<T: ?Sized + Write + Unpin> Write for Box<T> {
 
 impl<T: ?Sized + Write + Unpin> Write for &mut T {
     deref_async_write!();
+}
+
+impl<P> Write for Pin<P>
+where
+    P: DerefMut,
+    P::Target: Write,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        pin_as_deref_mut(self).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        pin_as_deref_mut(self).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        (**self).is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        pin_as_deref_mut(self).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        pin_as_deref_mut(self).poll_shutdown(cx)
+    }
+}
+
+/// Polyfill for Pin::as_deref_mut()
+/// TODO: use Pin::as_deref_mut() instead once stabilized
+fn pin_as_deref_mut<P: DerefMut>(pin: Pin<&mut Pin<P>>) -> Pin<&mut P::Target> {
+    // SAFETY: we go directly from Pin<&mut Pin<P>> to Pin<&mut P::Target>, without moving or
+    // giving out the &mut Pin<P> in the process. See Pin::as_deref_mut() for more detail.
+    unsafe { pin.get_unchecked_mut() }.as_mut()
 }

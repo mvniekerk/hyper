@@ -17,11 +17,14 @@ use hyper::{body::Incoming as IncomingBody, Request, Response, Version};
 pub use futures_util::{
     future, FutureExt as _, StreamExt as _, TryFutureExt as _, TryStreamExt as _,
 };
-pub use hyper::{HeaderMap, StatusCode};
+pub use hyper::HeaderMap;
 pub use std::net::SocketAddr;
 
 mod tokiort;
+#[allow(unused)]
 pub use tokiort::{TokioExecutor, TokioIo, TokioTimer};
+
+pub mod trailers;
 
 #[allow(unused_macros)]
 macro_rules! t {
@@ -199,7 +202,7 @@ macro_rules! __internal_req_res_prop {
         $prop_val
     };
     (status: $prop_val:expr) => {
-        StatusCode::from_u16($prop_val).expect("status code")
+        hyper::StatusCode::from_u16($prop_val).expect("status code")
     };
     ($prop_name:ident: $prop_val:expr) => {
         From::from($prop_val)
@@ -368,7 +371,7 @@ async fn async_test(cfg: __TestConfig) {
                 assert_eq!(req.method(), &sreq.method, "client method");
                 assert_eq!(req.version(), version, "client version");
                 for func in &sreq.headers {
-                    func(&req.headers());
+                    func(req.headers());
                 }
                 let sbody = sreq.body;
                 req.collect().map_ok(move |collected| {
@@ -457,7 +460,7 @@ async fn async_test(cfg: __TestConfig) {
             assert_eq!(res.status(), cstatus, "server status");
             assert_eq!(res.version(), version, "server version");
             for func in &cheaders {
-                func(&res.headers());
+                func(res.headers());
             }
 
             let body = res.collect().await.unwrap().to_bytes();

@@ -82,7 +82,7 @@ fn http1_parallel_x10_req_10kb_100_chunks(b: &mut test::Bencher) {
 #[bench]
 #[ignore]
 fn http1_parallel_x10_res_1mb(b: &mut test::Bencher) {
-    let body = &[b'x'; 1024 * 1024 * 1];
+    let body = &[b'x'; 1024 * 1024];
     opts().parallel(10).response_body(body).bench(b)
 }
 
@@ -140,7 +140,6 @@ fn http2_parallel_x10_req_10mb(b: &mut test::Bencher) {
 }
 
 #[bench]
-#[ignore]
 fn http2_parallel_x10_req_10kb_100_chunks(b: &mut test::Bencher) {
     let body = &[b'x'; 1024 * 10];
     opts()
@@ -152,7 +151,6 @@ fn http2_parallel_x10_req_10kb_100_chunks(b: &mut test::Bencher) {
 }
 
 #[bench]
-#[ignore]
 fn http2_parallel_x10_req_10kb_100_chunks_adaptive_window(b: &mut test::Bencher) {
     let body = &[b'x'; 1024 * 10];
     opts()
@@ -165,7 +163,6 @@ fn http2_parallel_x10_req_10kb_100_chunks_adaptive_window(b: &mut test::Bencher)
 }
 
 #[bench]
-#[ignore]
 fn http2_parallel_x10_req_10kb_100_chunks_max_window(b: &mut test::Bencher) {
     let body = &[b'x'; 1024 * 10];
     opts()
@@ -180,7 +177,7 @@ fn http2_parallel_x10_req_10kb_100_chunks_max_window(b: &mut test::Bencher) {
 
 #[bench]
 fn http2_parallel_x10_res_1mb(b: &mut test::Bencher) {
-    let body = &[b'x'; 1024 * 1024 * 1];
+    let body = &[b'x'; 1024 * 1024];
     opts()
         .http2()
         .parallel(10)
@@ -294,7 +291,7 @@ impl Opts {
                 .build()
                 .expect("rt build"),
         );
-        //let exec = rt.clone();
+        let exec = rt.clone();
 
         let req_len = self.request_body.map(|b| b.len()).unwrap_or(0) as u64;
         let req_len = if self.request_chunks > 0 {
@@ -344,19 +341,21 @@ impl Opts {
         let make_request = || {
             let chunk_cnt = self.request_chunks;
             let body = if chunk_cnt > 0 {
-                /*
-                let (mut tx, body) = Body::channel();
+                let (mut tx, rx) = futures_channel::mpsc::channel(0);
+
                 let chunk = self
                     .request_body
                     .expect("request_chunks means request_body");
                 exec.spawn(async move {
+                    use futures_util::SinkExt;
+                    use hyper::body::Frame;
                     for _ in 0..chunk_cnt {
-                        tx.send_data(chunk.into()).await.expect("send_data");
+                        tx.send(Ok(Frame::data(bytes::Bytes::from(chunk))))
+                            .await
+                            .expect("send_data");
                     }
                 });
-                body
-                */
-                todo!("request_chunks");
+                http_body_util::StreamBody::new(rx).boxed()
             } else if let Some(chunk) = self.request_body {
                 http_body_util::Full::new(bytes::Bytes::from(chunk)).boxed()
             } else {
@@ -414,6 +413,7 @@ fn spawn_server(rt: &tokio::runtime::Runtime, opts: &Opts) -> SocketAddr {
     let body = opts.response_body;
     let opts = opts.clone();
     rt.spawn(async move {
+        let _ = &opts;
         while let Ok((sock, _)) = listener.accept().await {
             let io = support::TokioIo::new(sock);
             if opts.http2 {
