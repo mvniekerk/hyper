@@ -33,13 +33,13 @@ itoa = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 pin-project-lite = "0.2.4"
 tower-service = "0.3"
-tokio = { git = "https://github.com/wasix-org/tokio.git", branch = "epoll", features = ["sync"] }
+tokio = { git = "https://github.com/mvniekerk/tokio.git", branch = "wasix-1.42.0", features = ["sync"] }
 want = "0.3"
 
 # Optional
 
-libc = { git = "https://github.com/wasix-org/libc.git", optional = true }
-socket2 = { git = "https://github.com/wasix-org/socket2.git", branch = "v0.4.9", optional = true, features = ["all"] }
+libc = { git = "https://github.com/wasix-org/libc.git", optional = true, branch = "wasix-0.2.155"}
+socket2 = { git = "https://github.com/mvniekerk/socket2.git", branch = "v0.5.5", optional = true, features = ["all"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
@@ -49,7 +49,7 @@ pretty_env_logger = "0.4"
 spmc = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { git = "https://github.com/wasix-org/tokio.git", branch = "epoll", features = [
+tokio = { git = "https://github.com/mvniekerk/tokio.git", branch = "wasix-1.42.0", features = [
     "fs",
     "macros",
     "io-std",
