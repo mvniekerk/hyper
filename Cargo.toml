@@ -38,7 +38,7 @@ want = "0.3"
 
 # Optional
 
-libc = { git = "https://github.com/wasix-org/libc.git", optional = true, branch = "wasix-0.2.155"}
+libc = { git = "https://github.com/mvniekerk/libc.git", optional = true, branch = "wasix-0.2.169"}
 socket2 = { git = "https://github.com/mvniekerk/socket2.git", branch = "v0.5.5", optional = true, features = ["all"] }
 
 [dev-dependencies]
